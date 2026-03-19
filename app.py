@@ -24,6 +24,20 @@ import sys
 import logging
 from datetime import datetime, timezone
 
+# ── sys.path-korjaus (Streamlit Cloud) ───────────────────────
+# Streamlit Cloud kloonaa repon kansioon /mount/src/taxiai_v0.1/
+# ja ajaa app.py:n sieltä. Python lisää kyllä tuon kansion
+# sys.path:iin, mutta se ei riitä: kaikki moduulit käyttävät
+# importteja muodossa "from src.taxiapp.X import ...", mikä vaatii
+# että /mount/src/taxiai_v0.1/ löytyy sys.path:ista niin, että
+# "src" on siellä tunnistettava paketti.
+# os.path.abspath(__file__) = /mount/src/taxiai_v0.1/app.py
+# _ROOT                      = /mount/src/taxiai_v0.1/
+# → sys.path.insert(0, _ROOT) tekee "src" löydettäväksi.
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import streamlit as st
 
 # ── Pakolliset ympäristömuuttujat ─────────────────────────────
