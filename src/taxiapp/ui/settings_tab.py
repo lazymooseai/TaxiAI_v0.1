@@ -17,6 +17,11 @@ from typing import Optional
 
 import streamlit as st
 
+# DEFAULT_WEIGHTS tuodaan database-moduulista.
+# Lazy import on vältetty tässä koska vakiota tarvitaan
+# moduulitason koodissa (PRESETS-dict, rivi ~216).
+from src.taxiapp.repository.database import DEFAULT_WEIGHTS  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
