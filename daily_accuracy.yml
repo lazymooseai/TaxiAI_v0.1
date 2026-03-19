@@ -1,0 +1,80 @@
+name: TaksiAI — Päivittäinen tarkkuuslaskenta
+
+on:
+  schedule:
+    # Ajetaan joka päivä klo 03:00 UTC (= 05:00 EET / 06:00 EEST)
+    - cron: "0 3 * * *"
+  # Manuaalinen käynnistys (testaamista varten)
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Päivämäärä (YYYY-MM-DD), tyhjä = eilen"
+        required: false
+        default: ""
+      driver_id:
+        description: "Driver UUID (tyhjä = kaikki)"
+        required: false
+        default: ""
+
+jobs:
+  calculate-accuracy:
+    name: Laske snapshotin tarkkuus
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+      SUPABASE_ANON_KEY:     ${{ secrets.SUPABASE_ANON_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+    steps:
+      - name: Checkout koodi
+        uses: actions/checkout@v4
+
+      - name: Asenna Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Asenna riippuvuudet
+        run: |
+          pip install --upgrade pip
+          pip install supabase river
+          # Ei tarvita kaikkia riippuvuuksia — vain ydin
+          pip install httpx
+
+      - name: Laske tarkkuus
+        run: |
+          python -c "
+          import sys, os
+          sys.path.insert(0, '.')
+
+          date    = os.environ.get('INPUT_DATE', '') or None
+          drv_id  = os.environ.get('INPUT_DRIVER_ID', '') or None
+
+          from src.taxiapp.demand_model import calculate_snapshot_accuracy
+          result = calculate_snapshot_accuracy(
+              driver_id=drv_id,
+              date_str=date,
+          )
+
+          if result:
+              print(f'Tarkkuus: {result[\"hit_rate\"]:.1%}')
+              print(f'Oikein:   {result[\"correct\"]}/{result[\"total\"]}')
+              print(f'Top-signaali: {result.get(\"top_signal\",\"–\")}')
+          else:
+              print('Ei dataa laskettavaksi (normaalia jos ei kyytejä)')
+              sys.exit(0)
+          "
+        env:
+          INPUT_DATE:      ${{ github.event.inputs.date }}
+          INPUT_DRIVER_ID: ${{ github.event.inputs.driver_id }}
+
+      - name: Ilmoita Slack (valinnainen)
+        if: ${{ failure() }}
+        run: |
+          echo "Tarkkuuslaskenta epäonnistui — tarkista GitHub Actions -lokit"
+          # Lisää Slack webhook tähän jos haluat ilmoitukset:
+          # curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+          #   -d '{"text":"TaksiAI tarkkuuslaskenta epäonnistui!"}'

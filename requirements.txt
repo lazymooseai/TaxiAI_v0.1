@@ -1,0 +1,30 @@
+# Helsinki Taxi AI — riippuvuudet
+# pip install -r requirements.txt
+
+# ── Streamlit UI ──────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Tietokanta ────────────────────────────────────────────────
+supabase>=2.4.0
+
+# ── HTTP-asiakaskirjasto ──────────────────────────────────────
+httpx>=0.27.0
+
+# ── Dokumentinlukija (OCR + PDF) ─────────────────────────────
+easyocr>=1.7.0          # kuva-OCR (image, skannattu PDF)
+pymupdf>=1.24.0         # PDF-tuki (digitaalinen + skannattu)
+Pillow>=10.0.0          # Kuvamanipulaatio (HEIC-muunnos)
+numpy>=1.24.0           # Kuvadatan käsittely (EasyOCR tarvitsee)
+
+# ── Online ML-malli ───────────────────────────────────────────
+river>=0.21.0           # Kysynnän ennustemalli (online learning)
+
+# ── RSS-parsiminen (valinnainen, tehokkaampi kuin regex) ──────
+feedparser>=6.0.11
+
+# ── Data-analyysi tilastonäkymälle ───────────────────────────
+pandas>=2.0.0
+
+# ── Tuotantopalvelin ─────────────────────────────────────────
+# (Streamlit Cloud asentaa automaattisesti)
+# watchdog>=4.0.0
