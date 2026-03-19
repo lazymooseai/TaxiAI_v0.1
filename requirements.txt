@@ -17,7 +17,7 @@ Pillow>=10.0.0          # Kuvamanipulaatio (HEIC-muunnos)
 numpy>=1.24.0           # Kuvadatan käsittely (EasyOCR tarvitsee)
 
 # ── Online ML-malli ───────────────────────────────────────────
-river>=0.21.0           # Kysynnän ennustemalli (online learning)
+river>=0.23.0           # Kysynnän ennustemalli (online learning)
 
 # ── RSS-parsiminen (valinnainen, tehokkaampi kuin regex) ──────
 feedparser>=6.0.11
