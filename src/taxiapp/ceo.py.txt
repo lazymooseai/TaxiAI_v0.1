@@ -1,0 +1,666 @@
+“””
+ceo.py — TaxiCEOAgent — Orkestraattori
+Helsinki Taxi AI
+
+Kerää kaikkien agenttien signaalit asyncio.gather:lla,
+laskee aluepisteet kuljettajan painoilla ja palauttaa
+3 dynaamista korttia dashboardille.
+
+Kortti #1 PUNAINEN  = OVERRIDE häiriö TAI korkein pisteytys
+Kortti #2 KULTA     = toiseksi korkein
+Kortti #3 SININEN   = AINA ennakoiva (seuraava iso piikki)
+
+CEO-prioriteettitasot:
+Taso 5 OVERRIDE   (urgency 9-10): lakko, suuri onnettomuus, metro poikki
+Taso 4 KRIITTINEN (urgency 7-8):  juna >30min, myrsky, lento >60min
+Taso 3 KORKEA     (urgency 5-6):  tapahtuma loppuu, iso laiva, rankkasade
+Taso 2 NORMAALI   (urgency 3-4):  tapahtuma 20-60min, juna 15min
+Taso 1 PERUS      (urgency 1-2):  historialliset pisteet, aika/päivä
+“””
+
+from **future** import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+from src.taxiapp.base_agent import BaseAgent, AgentResult, Signal
+from src.taxiapp.areas import AREAS, Area
+from src.taxiapp.location import (
+apply_location_bonus,
+get_location_bonuses,
+enrich_blue_card_reason,
+get_train_area_priority,
+)
+
+logger = logging.getLogger(**name**)
+
+# ══════════════════════════════════════════════════════════════
+
+# VAKIOT
+
+# ══════════════════════════════════════════════════════════════
+
+# Oletuspainot — kuljettaja voi säätää Asetukset-välilehdeltä
+
+DEFAULT_WEIGHTS: dict[str, float] = {
+“weight_trains”:    1.0,
+“weight_flights”:   1.0,
+“weight_ferries”:   1.0,
+“weight_events”:    1.0,
+“weight_weather”:   1.0,
+“weight_nightlife”: 1.0,
+“weight_sports”:    1.0,
+“weight_business”:  1.0,
+}
+
+# Agentin nimi → paino-avain
+
+AGENT_WEIGHT_MAP: dict[str, str] = {
+“TrainAgent”:        “weight_trains”,
+“FlightAgent”:       “weight_flights”,
+“FerryAgent”:        “weight_ferries”,
+“EventsAgent”:       “weight_events”,
+“WeatherAgent”:      “weight_weather”,
+“SocialMediaAgent”:  “weight_weather”,   # Uutiset → sää/yleinen
+“DisruptionAgent”:   “weight_trains”,    # Häiriöt → liikenne
+“RestaurantAgent”:   “weight_nightlife”,
+“TicketAgent”:       “weight_events”,
+“OCRDispatchAgent”:  “weight_business”,
+}
+
+# Kategorian painokerroin
+
+CATEGORY_WEIGHT_MAP: dict[str, str] = {
+“trains”:    “weight_trains”,
+“airport”:   “weight_flights”,
+“ferries”:   “weight_ferries”,
+“concerts”:  “weight_events”,
+“culture”:   “weight_events”,
+“sports”:    “weight_sports”,
+“nightlife”: “weight_nightlife”,
+“business”:  “weight_business”,
+}
+
+# Urgency-raja OVERRIDE-kortille
+
+OVERRIDE_URGENCY = 9
+
+# Sininen kortti: ennakoiva — etsii signaalit jotka eivät vielä ole huipussaan
+
+BLUE_LOOKAHEAD_MINUTES = 60
+
+# ══════════════════════════════════════════════════════════════
+
+# HOTSPOT — yksi kortti dashboardille
+
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class Hotspot:
+“””
+CEO:n laskema hotspot-suositus yhdelle alueelle.
+Vastaa yhtä dashboard-korttia.
+“””
+rank:       int           # 1=punainen, 2=kulta, 3=sininen
+area:       str           # AREAS-avain
+score:      float         # Kokonaispisteet
+urgency:    int           # Korkein urgency tällä alueella
+reasons:    list[str]     # Top-3 syytä (kuljettajalle)
+signals:    list[Signal]  # Kaikki alueen signaalit
+card_color: str           # “red” | “gold” | “blue”
+predictive: bool          # True = sininen ennakoiva kortti
+created_at: datetime      = field(
+default_factory=lambda: datetime.now(timezone.utc)
+)
+
+```
+@property
+def area_obj(self) -> Optional[Area]:
+    return AREAS.get(self.area)
+
+@property
+def top_reason(self) -> str:
+    return self.reasons[0] if self.reasons else f"Alue: {self.area}"
+
+@property
+def is_override(self) -> bool:
+    return self.urgency >= OVERRIDE_URGENCY
+
+def to_dict(self) -> dict:
+    return {
+        "rank":       self.rank,
+        "area":       self.area,
+        "score":      round(self.score, 1),
+        "urgency":    self.urgency,
+        "reasons":    self.reasons[:3],
+        "card_color": self.card_color,
+        "predictive": self.predictive,
+        "lat":        self.area_obj.lat if self.area_obj else None,
+        "lon":        self.area_obj.lon if self.area_obj else None,
+        "created_at": self.created_at.isoformat(),
+    }
+```
+
+# ══════════════════════════════════════════════════════════════
+
+# CEO-ORKESTRAATTORI
+
+# ══════════════════════════════════════════════════════════════
+
+class TaxiCEOAgent:
+“””
+Kerää kaikkien agenttien tulokset asyncio.gather:lla.
+Laskee aluepisteet ja palauttaa 3 dynaamista korttia.
+
+```
+Käyttö:
+    ceo = TaxiCEOAgent(agents=[...], weights={...})
+    hotspots = await ceo.run()
+"""
+
+def __init__(
+    self,
+    agents: list[BaseAgent],
+    weights: Optional[dict[str, float]] = None,
+    driver_id: Optional[str] = None,
+    location: Optional[tuple[float, float]] = None,
+):
+    self.agents    = agents
+    self.weights   = {**DEFAULT_WEIGHTS, **(weights or {})}
+    self.driver_id = driver_id
+    self.location  = location   # (lat, lon) | None — päivitetään run()-kutsussa
+    self.logger    = logging.getLogger("taxiapp.ceo")
+
+# ── Päämetodi ─────────────────────────────────────────────
+
+async def run(self) -> tuple[list[Hotspot], list[AgentResult]]:
+    """
+    Aja kaikki agentit rinnakkain.
+    Palauta (3 hotspotia, kaikki tulokset).
+    Yksi kaatunut agentti ei kaada muita.
+    """
+    # Hae kuljettajan sijainti session_statesta (Streamlit-ympäristössä)
+    try:
+        from src.taxiapp.location import get_driver_location
+        live_loc = get_driver_location()
+        if live_loc:
+            self.location = live_loc
+    except Exception as e:
+        logger.debug(f"GPS-sijainnin haku epäonnistui: {e}")
+    results = await asyncio.gather(
+        *[agent.fetch_with_cache() for agent in self.agents],
+        return_exceptions=True,
+    )
+
+    # Normalisoi poikkeukset AgentResult-olioiksi
+    agent_results: list[AgentResult] = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            agent_name = self.agents[i].name if i < len(self.agents) else "?"
+            self.logger.error(
+                f"CEO: agentti {agent_name} kaatui: {result}"
+            )
+            from src.taxiapp.base_agent import AgentResult as AR
+            agent_results.append(AR(
+                agent_name=agent_name,
+                status="error",
+                error_msg=str(result),
+            ))
+        elif isinstance(result, AgentResult):
+            agent_results.append(result)
+        else:
+            self.logger.warning(f"CEO: tuntematon tulos tyyppi {type(result)}")
+
+    # Kerää ja painota signaalit
+    area_scores, area_signals = self._aggregate_signals(agent_results)
+
+    # Lisää sijaintipohjainen etäisyysbonus
+    area_scores = apply_location_bonus(area_scores, self.location)
+
+    # Pääkallokeli-boost sairaala-alueille
+    area_scores = self._hospital_boost(area_scores, agent_results)
+
+    # Rakenna 3 korttia
+    hotspots = self._build_hotspots(area_scores, area_signals)
+
+    # Tallenna snapshot tietokantaan (ei-kriittinen)
+    if self.driver_id:
+        self._save_snapshot(hotspots)
+
+    self.logger.info(
+        f"CEO: {len(agent_results)} agenttia | "
+        f"{sum(len(r.signals) for r in agent_results)} signaalia | "
+        f"3 korttia → {[h.area for h in hotspots]}"
+    )
+    return hotspots, agent_results
+
+# ── Signaalien aggregointi ─────────────────────────────────
+
+def _aggregate_signals(
+    self,
+    results: list[AgentResult],
+) -> tuple[dict[str, float], dict[str, list[Signal]]]:
+    """
+    Kerää kaikki voimassaolevat signaalit ja laske aluepisteet.
+    Kuljettajan painot skalaavat agenttikohtaiset signaalit.
+    Alueella olevat kategoriat lisäävät painon.
+    """
+    area_scores:  dict[str, float]         = {}
+    area_signals: dict[str, list[Signal]]  = {}
+
+    # Alusta peruspistemäärät historiallisin tiedoin
+    for area_name, area in AREAS.items():
+        area_scores[area_name]  = area.base_score
+        area_signals[area_name] = []
+
+    for result in results:
+        if result.status in ("error", "disabled"):
+            continue
+
+        # Kuljettajan paino tälle agentille
+        agent_weight = self._get_agent_weight(result.agent_name)
+
+        for sig in result.valid_signals:
+            if sig.area not in AREAS:
+                continue
+
+            # Aluekohtainen kategorialisäpaino
+            area_obj = AREAS[sig.area]
+            category_weight = self._get_category_weight(area_obj)
+
+            # Yhdistetty paino: agentti × kategoria
+            combined_weight = agent_weight * category_weight
+
+            # Urgency-bonus: kriittiset signaalit saavat lisäboostin
+            urgency_multiplier = self._urgency_multiplier(sig.urgency)
+
+            weighted_score = (
+                sig.score_delta
+                * combined_weight
+                * urgency_multiplier
+            )
+
+            area_scores[sig.area]  = area_scores.get(sig.area, 0) + weighted_score
+            area_signals[sig.area].append(sig)
+
+    return area_scores, area_signals
+
+def _get_agent_weight(self, agent_name: str) -> float:
+    """Hae kuljettajan paino agentille."""
+    weight_key = AGENT_WEIGHT_MAP.get(agent_name)
+    if weight_key:
+        return self.weights.get(weight_key, 1.0)
+    return 1.0
+
+def _get_category_weight(self, area: Area) -> float:
+    """
+    Laske alueen kategorioiden keskipaino.
+    Alue voi kuulua useaan kategoriaan — käytetään maksimia.
+    """
+    if not area.categories:
+        return 1.0
+    weights = []
+    for cat in area.categories:
+        key = CATEGORY_WEIGHT_MAP.get(cat)
+        if key:
+            weights.append(self.weights.get(key, 1.0))
+    return max(weights) if weights else 1.0
+
+def _urgency_multiplier(self, urgency: int) -> float:
+    """Urgency → pistekerrroin."""
+    if urgency >= 9:  return 3.0   # OVERRIDE
+    if urgency >= 7:  return 2.0   # KRIITTINEN (ml. pääkallokeli)
+    if urgency >= 5:  return 1.5   # KORKEA
+    if urgency >= 3:  return 1.2   # NORMAALI
+    return 1.0                     # PERUS
+
+def _hospital_boost(
+    self,
+    area_scores:  dict[str, float],
+    agent_results: list,
+) -> dict[str, float]:
+    """
+    Pääkallokeli-boost (taso 3.5 alkuperäisessä spesifissä):
+    Jos WeatherAgent tai SocialMediaAgent raportoi
+    slippery_index >= 0.7 ja uutisosumia >= 3,
+    sairaala-alueet saavat +40% pisteboostin.
+
+    KORJAUS: Alkuperäinen käytti float-prioriteettitasoa 3.5
+    joka ei sovi urgency-integer-järjestelmään.
+    Toteutetaan boost_multiplier-kertoimena.
+    """
+    # Hae slippery_index WeatherAgentin raw_data:sta
+    slippery_index = 0.0
+    slippery_news_count = 0
+
+    for r in agent_results:
+        if r.agent_name == "WeatherAgent" and r.status == "ok":
+            slippery_index = r.raw_data.get("slippery_index", 0.0) or 0.0
+        if r.agent_name == "SocialMediaAgent" and r.status == "ok":
+            slippery_news_count = r.raw_data.get("slippery_signals", 0) or 0
+
+    # Laukaisee vain kun molemmat vahvistavat
+    if slippery_index < 0.7 or slippery_news_count < 1:
+        return area_scores
+
+    boost = 1.4   # +40%
+
+    try:
+        from src.taxiapp.repository.database import HospitalRepo
+        hospitals = HospitalRepo.get_active()
+    except Exception:
+        return area_scores
+
+    from src.taxiapp.areas import AREAS
+    _fallback = {
+        "Meilahti":"Olympiastadion","Malmi":"Pasila",
+        "Espoo":"Lentokenttä","Vantaa":"Tikkurila",
+    }
+    boosted = dict(area_scores)
+    for h in hospitals:
+        area = h.get("area_name", "")
+        if area not in AREAS:
+            area = _fallback.get(area, "")
+        if area and area in boosted:
+            boosted[area] = round(boosted[area] * boost, 1)
+
+    self.logger.info(
+        f"CEO: pääkallokeli boost x{boost} "
+        f"(slippery={slippery_index:.2f}, "
+        f"uutiset={slippery_news_count})"
+    )
+    return boosted
+
+# ── Korttien rakentaminen ──────────────────────────────────
+
+def _build_hotspots(
+    self,
+    area_scores:  dict[str, float],
+    area_signals: dict[str, list[Signal]],
+) -> list[Hotspot]:
+    """
+    Rakenna 3 korttia:
+      #1 PUNAINEN: OVERRIDE-häiriö TAI korkein pisteys
+      #2 KULTA:    Toiseksi korkein (ei sama kuin #1)
+      #3 SININEN:  Ennakoiva — seuraava iso piikki
+    """
+    # Järjestä alueet pisteiden mukaan
+    ranked = sorted(
+        [(area, score) for area, score in area_scores.items()
+         if area in AREAS],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    # ── Kortti #1: PUNAINEN ───────────────────────────────
+    # Etsi ensin OVERRIDE (urgency ≥ 9)
+    override_area = self._find_override(area_signals)
+
+    if override_area:
+        card1_area = override_area
+    else:
+        card1_area = ranked[0][0] if ranked else "Rautatieasema"
+
+    card1 = self._make_hotspot(
+        rank=1,
+        area=card1_area,
+        score=area_scores.get(card1_area, 0),
+        signals=area_signals.get(card1_area, []),
+        card_color="red",
+        predictive=False,
+    )
+
+    # ── Kortti #2: KULTA ──────────────────────────────────
+    card2_area = None
+    for area, _ in ranked:
+        if area != card1_area:
+            card2_area = area
+            break
+    if not card2_area:
+        card2_area = ranked[1][0] if len(ranked) > 1 else "Kamppi"
+
+    card2 = self._make_hotspot(
+        rank=2,
+        area=card2_area,
+        score=area_scores.get(card2_area, 0),
+        signals=area_signals.get(card2_area, []),
+        card_color="gold",
+        predictive=False,
+    )
+
+    # ── Kortti #3: SININEN — AINA ennakoiva ───────────────
+    blue_area = self._find_predictive(
+        area_scores, area_signals, exclude={card1_area, card2_area}
+    )
+    card3 = self._make_hotspot(
+        rank=3,
+        area=blue_area,
+        score=area_scores.get(blue_area, 0),
+        signals=area_signals.get(blue_area, []),
+        card_color="blue",
+        predictive=True,
+    )
+
+    return [card1, card2, card3]
+
+def _find_override(
+    self, area_signals: dict[str, list[Signal]]
+) -> Optional[str]:
+    """
+    Etsi alue jolla on OVERRIDE-tason signaali (urgency ≥ 9).
+    Palauta korkein-urgency-alue tai None.
+    """
+    best_area:    Optional[str] = None
+    best_urgency: int           = OVERRIDE_URGENCY - 1
+
+    for area, signals in area_signals.items():
+        for sig in signals:
+            if sig.urgency >= OVERRIDE_URGENCY and sig.urgency > best_urgency:
+                best_urgency = sig.urgency
+                best_area    = area
+
+    return best_area
+
+def _find_predictive(
+    self,
+    area_scores:  dict[str, float],
+    area_signals: dict[str, list[Signal]],
+    exclude:      set[str],
+) -> str:
+    """
+    Etsi ennakoiva alue siniselle kortille.
+    Strategia: alue jolla on tulevia (ei vielä huipussaan) signaaleja
+    seuraavan 60min aikana.
+    """
+    now     = datetime.now(timezone.utc)
+    cutoff  = now + timedelta(minutes=BLUE_LOOKAHEAD_MINUTES)
+    horizon = now + timedelta(minutes=5)  # Ei aivan heti
+
+    # Laske tulevan piikki-score per alue
+    future_scores: dict[str, float] = {}
+
+    for area, signals in area_signals.items():
+        if area in exclude:
+            continue
+        future = sum(
+            sig.score_delta
+            for sig in signals
+            if sig.expires_at > horizon and sig.expires_at <= cutoff
+        )
+        if future > 0:
+            future_scores[area] = future
+
+    if future_scores:
+        return max(future_scores, key=future_scores.get)
+
+    # Fallback: korkein pisteys pois lukien jo valitut
+    for area, _ in sorted(
+        area_scores.items(), key=lambda x: x[1], reverse=True
+    ):
+        if area not in exclude and area in AREAS:
+            return area
+
+    return "Lentokenttä"   # Viimeinen fallback
+
+def _make_hotspot(
+    self,
+    rank:       int,
+    area:       str,
+    score:      float,
+    signals:    list[Signal],
+    card_color: str,
+    predictive: bool,
+) -> Hotspot:
+    """Rakenna Hotspot-olio yhdelle alueelle."""
+    # Järjestä signaalit urgency-järjestykseen
+    sorted_sigs = sorted(signals, key=lambda s: s.urgency, reverse=True)
+    top_urgency = sorted_sigs[0].urgency if sorted_sigs else 1
+
+    # Top-3 syytä dashboardille
+    reasons = [sig.reason for sig in sorted_sigs[:3]]
+    if not reasons:
+        area_obj = AREAS.get(area)
+        if area_obj:
+            cats = ", ".join(area_obj.categories[:2])
+            reasons = [f"📍 {area} — {cats}"]
+        else:
+            reasons = [f"📍 {area}"]
+
+    # Rikasta sinistä korttia sijainnilla
+    if card_color == "blue" and self.location:
+        loc_reason = enrich_blue_card_reason(area, self.location)
+        if loc_reason and loc_reason not in reasons:
+            reasons = [loc_reason] + reasons[:2]
+
+    return Hotspot(
+        rank=rank,
+        area=area,
+        score=round(score, 1),
+        urgency=top_urgency,
+        reasons=reasons,
+        signals=sorted_sigs,
+        card_color=card_color,
+        predictive=predictive,
+    )
+
+# ── Tietokantatallennus ────────────────────────────────────
+
+def _save_snapshot(self, hotspots: list[Hotspot]) -> None:
+    """Tallenna 3 korttia tietokantaan (asynkronisesti)."""
+    try:
+        from src.taxiapp.repository.database import HotspotRepo
+        rows = [
+            {
+                "rank":    h.rank,
+                "area":    h.area,
+                "score":   h.score,
+                "reasons": h.reasons,
+                "urgency": h.urgency,
+            }
+            for h in hotspots
+        ]
+        HotspotRepo.save_snapshot(self.driver_id, rows)
+    except Exception as ex:
+        self.logger.debug(f"Snapshot-tallennus epäonnistui: {ex}")
+
+# ── Agenttitiivistelmä ────────────────────────────────────
+
+def agent_summary(
+    self, results: list[AgentResult]
+) -> list[dict]:
+    """
+    Tiivistelmä agenttien tilasta dashboardille.
+    Näytetään ⚠️ viallisille agenteille.
+    """
+    return [
+        {
+            "name":     r.agent_name,
+            "status":   r.status,
+            "signals":  len(r.signals),
+            "summary":  r.summary(),
+            "duration": round(r.fetch_duration_ms or 0, 0),
+        }
+        for r in results
+    ]
+```
+
+# ══════════════════════════════════════════════════════════════
+
+# AGENTTIREKISTERI — luo kaikki agentit
+
+# ══════════════════════════════════════════════════════════════
+
+def build_agents() -> list[BaseAgent]:
+“””
+Luo kaikki data-agentit.
+Agentit luodaan lazy-load: epäonnistunut importti ei kaada muita.
+“””
+agents: list[BaseAgent] = []
+
+```
+agent_classes = [
+    ("src.taxiapp.agents.disruptions", "DisruptionAgent"),
+    ("src.taxiapp.agents.weather",     "WeatherAgent"),
+    ("src.taxiapp.agents.trains",      "TrainAgent"),
+    ("src.taxiapp.agents.flights",     "FlightAgent"),
+    ("src.taxiapp.agents.ferries",     "FerryAgent"),
+    ("src.taxiapp.agents.events",      "EventsAgent"),
+    ("src.taxiapp.agents.social_media","SocialMediaAgent"),
+]
+
+for module_path, class_name in agent_classes:
+    try:
+        import importlib
+        import importlib.util
+        import sys as _sys
+        try:
+            module = importlib.import_module(module_path)
+        except SyntaxError:
+            # Korjataan automaattisesti iPhonen typografiset lainausmerkit
+            parts = module_path.split(".")
+            file_path = _sys.path[0] + "/" + "/".join(parts) + ".py"
+            with open(file_path, "r", encoding="utf-8", errors="replace") as _f:
+                src = _f.read()
+            replacements = [
+                ("\u201c", chr(34)), ("\u201d", chr(34)),
+                ("\u2018", chr(39)), ("\u2019", chr(39)),
+                ("\u2013", "-"),     ("\u2014", "-"),
+            ]
+            for bad, good in replacements:
+                src = src.replace(bad, good)
+            spec = importlib.util.spec_from_file_location(module_path, file_path)
+            module = importlib.util.module_from_spec(spec)
+            exec(compile(src, file_path, "exec"), module.__dict__)
+            _sys.modules[module_path] = module
+            logger.info(f"Agentti korjattu ja ladattu: {class_name}")
+        cls = getattr(module, class_name)
+        agents.append(cls())
+        logger.debug(f"Agentti ladattu: {class_name}")
+    except Exception as ex:
+        logger.warning(f"Agentin lataus epäonnistui {class_name}: {ex}")
+
+logger.info(f"Agentit: {len(agents)}/{len(agent_classes)} ladattu")
+return agents
+```
+
+def build_ceo(
+driver_id: Optional[str]             = None,
+weights:   Optional[dict]            = None,
+agents:    Optional[list[BaseAgent]] = None,
+location:  Optional[tuple[float, float]] = None,
+) -> TaxiCEOAgent:
+“””
+Rakenna CEO-instanssi.
+Käytetään Streamlit-sovelluksessa.
+“””
+if agents is None:
+agents = build_agents()
+return TaxiCEOAgent(
+agents=agents,
+weights=weights,
+driver_id=driver_id,
+location=location,
+)
