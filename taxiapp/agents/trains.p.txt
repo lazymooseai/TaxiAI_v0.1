@@ -1,0 +1,543 @@
+“””
+trains.py — Digitraffic junat-agentti
+Helsinki Taxi AI
+
+Hakee lähijunien saapumiset Helsingin kolmelle pääasemalle:
+HKI = Helsinki päärautatieasema (AREAS: Rautatieasema)
+PSL = Pasila                    (AREAS: Pasila)
+TKL = Tikkurila                 (AREAS: Tikkurila)
+
+Aikaikkuna: seuraavat 2h
+Maksimi per asema: 10 junaa
+ttl = 120s (2 min)
+
+API: Digitraffic rata.digitraffic.fi REST
+GET /live-trains/station/{station}?arrived_trains=0&arriving_trains=10
+&departed_trains=0&departing_trains=0&include_nonstopping=false
+
+Signaalit (CEO prioriteetti):
+Taso 4 KRIITTINEN (urgency 8): juna >30min myöhässä
+Taso 3 KORKEA    (urgency 6): juna saapuu 0-5min
+Taso 2 NORMAALI  (urgency 5): juna saapuu 5-15min
+Taso 1 PERUS     (urgency 3): juna saapuu 15-30min
+Myöhässä >15min  (urgency 7): kriittinen myöhästyminen
+Myöhässä 5-15min (urgency 5): kohtalainen myöhästyminen
+“””
+
+from **future** import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+import httpx
+
+from src.taxiapp.base_agent import BaseAgent, AgentResult, Signal
+
+# ══════════════════════════════════════════════════════════════
+
+# VAKIOT
+
+# ══════════════════════════════════════════════════════════════
+
+# Asemakoodi → AREAS-avain + ihmisluettava nimi
+
+STATION_MAP: dict[str, dict] = {
+“HKI”: {
+“area”:      “Rautatieasema”,
+“name”:      “Helsinki”,
+“full_name”: “Helsingin päärautatieasema”,
+},
+“PSL”: {
+“area”:      “Pasila”,
+“name”:      “Pasila”,
+“full_name”: “Pasila”,
+},
+“TKL”: {
+“area”:      “Tikkurila”,
+“name”:      “Tikkurila”,
+“full_name”: “Tikkurila”,
+},
+}
+
+DIGITRAFFIC_BASE = “https://rata.digitraffic.fi/api/v1”
+MAX_TRAINS_PER_STATION = 10
+LOOKAHEAD_HOURS = 2
+
+# Linja-tyypit joista ei tule paljon kyytejä (tavarajunat ym.)
+
+SKIP_TRAIN_CATEGORIES = {“Cargo”, “Shunting”, “Test”}
+
+# ══════════════════════════════════════════════════════════════
+
+# JUNA-DATACLASS
+
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class TrainArrival:
+“”“Yksittäisen junan saapumistiedot asemalle.”””
+train_number:   int
+train_type:     str          # “IC”,“S”,“R”,“HSL” jne.
+train_category: str          # “Long-distance”,“Commuter”,“Cargo”
+station_code:   str          # “HKI”,“PSL”,“TKL”
+scheduled_at:   datetime     # Aikataulun mukainen saapumisaika
+estimated_at:   Optional[datetime] = None   # Ennustettu saapumisaika
+actual_at:      Optional[datetime] = None   # Toteutunut saapumisaika
+cancelled:      bool = False
+origin:         str  = “”    # Lähtöasema
+destination:    str  = “”    # Pääteasema
+track:          Optional[int] = None        # Raide
+
+```
+@property
+def effective_at(self) -> datetime:
+    """Paras arvaus saapumisajasta."""
+    return self.actual_at or self.estimated_at or self.scheduled_at
+
+@property
+def delay_minutes(self) -> int:
+    """Myöhästyminen minuuteissa (0 = ajallaan tai aikainen)."""
+    best = self.estimated_at or self.actual_at
+    if best is None:
+        return 0
+    delta = (best - self.scheduled_at).total_seconds() / 60
+    return max(0, int(delta))
+
+@property
+def minutes_until_arrival(self) -> float:
+    """Minuuttia saapumiseen nyt-hetkestä."""
+    now = datetime.now(timezone.utc)
+    return (self.effective_at - now).total_seconds() / 60
+
+@property
+def area(self) -> str:
+    return STATION_MAP[self.station_code]["area"]
+
+@property
+def station_name(self) -> str:
+    return STATION_MAP[self.station_code]["name"]
+
+def is_arriving_soon(self, minutes: float = 30) -> bool:
+    """Saapuuko juna seuraavan X minuutin aikana?"""
+    eta = self.minutes_until_arrival
+    return -2 <= eta <= minutes   # -2 = juuri saapunut
+
+def label(self) -> str:
+    """Lyhyt tunniste: 'IC123 HKI' tai 'S42 PSL'"""
+    return f"{self.train_type}{self.train_number} {self.station_code}"
+
+def delay_label(self) -> str:
+    d = self.delay_minutes
+    if d == 0:
+        return "ajallaan"
+    return f"+{d} min myöhässä"
+```
+
+# ══════════════════════════════════════════════════════════════
+
+# JUNAAGENTTI
+
+# ══════════════════════════════════════════════════════════════
+
+class TrainAgent(BaseAgent):
+“””
+Hakee saapuvat junat HKI / PSL / TKL.
+Päivittyy 2 min välein (ttl=120).
+“””
+
+```
+name = "TrainAgent"
+ttl  = 120
+
+async def fetch(self) -> AgentResult:
+    all_arrivals: list[TrainArrival] = []
+    station_errors: dict[str, str]  = {}
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(12.0),
+        headers={
+            "User-Agent":    "HelsinkiTaxiAI/1.0 (+https://github.com)",
+            "Accept":        "application/json",
+            "Digitraffic-User": "HelsinkiTaxiAI/1.0",
+        },
+        follow_redirects=True,
+    ) as client:
+        for station_code in STATION_MAP:
+            arrivals, error = await self._fetch_station(
+                client, station_code
+            )
+            if error:
+                station_errors[station_code] = error
+                self.logger.warning(
+                    f"TrainAgent {station_code}: {error}"
+                )
+            else:
+                all_arrivals.extend(arrivals)
+
+    # Jos kaikki asemat epäonnistuivat → virhe
+    if not all_arrivals and len(station_errors) == len(STATION_MAP):
+        return self._error(
+            "Kaikki asemat epäonnistuivat: "
+            + "; ".join(f"{k}: {v}" for k, v in station_errors.items())
+        )
+
+    # Suodata: vain saapuvat seuraavien 2h aikana
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(hours=LOOKAHEAD_HOURS)
+    arriving = [
+        a for a in all_arrivals
+        if not a.cancelled
+        and a.effective_at >= now - timedelta(minutes=2)
+        and a.effective_at <= cutoff
+    ]
+
+    signals = self._build_signals(arriving)
+    signals.sort(key=lambda s: s.urgency, reverse=True)
+
+    raw = {
+        "stations":     list(STATION_MAP.keys()),
+        "total_trains": len(arriving),
+        "by_station": {
+            code: [
+                {
+                    "train":      a.label(),
+                    "scheduled":  a.scheduled_at.isoformat(),
+                    "estimated":  a.estimated_at.isoformat()
+                                  if a.estimated_at else None,
+                    "delay_min":  a.delay_minutes,
+                    "eta_min":    round(a.minutes_until_arrival, 1),
+                    "origin":     a.origin,
+                    "track":      a.track,
+                }
+                for a in arriving
+                if a.station_code == code
+            ]
+            for code in STATION_MAP
+        },
+        "errors": station_errors,
+    }
+
+    self.logger.info(
+        f"TrainAgent: {len(arriving)} junaa (HKI/PSL/TKL) "
+        f"→ {len(signals)} signaalia"
+    )
+    return self._ok(signals, raw_data=raw)
+
+# ── Yksittäisen aseman haku ────────────────────────────────
+
+async def _fetch_station(
+    self,
+    client: httpx.AsyncClient,
+    station_code: str,
+) -> tuple[list[TrainArrival], Optional[str]]:
+    """
+    Hae saapuvat junat yhdelle asemalle.
+    Käyttää live-trains/station-endpointia.
+    """
+    url = (f"{DIGITRAFFIC_BASE}/live-trains/station/{station_code}")
+    params = {
+        "arrived_trains":    0,
+        "arriving_trains":   MAX_TRAINS_PER_STATION,
+        "departed_trains":   0,
+        "departing_trains":  0,
+        "include_nonstopping": "false",
+    }
+    try:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        arrivals = _parse_trains(data, station_code)
+        self.logger.debug(
+            f"{station_code}: {len(arrivals)} junaa jäsennetty"
+        )
+        return arrivals, None
+    except httpx.HTTPStatusError as e:
+        return [], f"HTTP {e.response.status_code}"
+    except httpx.RequestError as e:
+        return [], f"Verkkovirhe: {e}"
+    except Exception as e:
+        return [], f"Virhe: {e}"
+
+# ── Signaalien rakentaminen ────────────────────────────────
+
+def _build_signals(
+    self, arrivals: list[TrainArrival]
+) -> list[Signal]:
+    """
+    Muunna saapuvat junat signaaleiksi.
+
+    Logiikka:
+      - Korkea urgency myöhässä oleville junille (suurempi tarve kyydeille)
+      - Saapumisaika → urgency sen mukaan kuinka pian juna saapuu
+      - Pistemäärä skaalautuu matkustajamäärän mukaan
+        (IC/S > R/HSL pendolino > tavalliset)
+    """
+    signals: list[Signal] = []
+    # Ryhmitä asemittain — paras signaali per asema
+    by_station: dict[str, list[TrainArrival]] = {
+        code: [] for code in STATION_MAP
+    }
+    for a in arrivals:
+        by_station[a.station_code].append(a)
+
+    for station_code, trains in by_station.items():
+        if not trains:
+            continue
+
+        station_signals = []
+        for train in trains:
+            sig = self._train_to_signal(train)
+            if sig:
+                station_signals.append(sig)
+
+        signals.extend(station_signals)
+
+    return signals
+
+def _train_to_signal(
+    self, train: TrainArrival
+) -> Optional[Signal]:
+    """Muunna yksittäinen junavuoro signaaliksi."""
+    now = datetime.now(timezone.utc)
+    eta = train.minutes_until_arrival
+    delay = train.delay_minutes
+
+    # Jätä pois jo lähteneet (>2 min sitten) ja kaukana olevat
+    if eta < -2 or eta > 120:
+        return None
+
+    # Kategoriapainot (kuinka paljon matkustajia)
+    score_base = _train_score_base(train)
+
+    # ── Myöhästymisbonus ────────────────────────────────
+    delay_urgency = 1
+    delay_bonus   = 0.0
+
+    if delay >= 30:
+        delay_urgency = 8
+        delay_bonus   = 25.0
+        reason = (
+            f"🔴 {train.label()} MYÖHÄSSÄ {delay}min "
+            f"({train.origin}→{train.station_name})"
+        )
+    elif delay >= 15:
+        delay_urgency = 7
+        delay_bonus   = 15.0
+        reason = (
+            f"🟠 {train.label()} myöhässä {delay}min "
+            f"({train.origin}→{train.station_name})"
+        )
+    elif delay >= 5:
+        delay_urgency = 5
+        delay_bonus   = 8.0
+        reason = (
+            f"🟡 {train.label()} +{delay}min "
+            f"({train.origin}→{train.station_name})"
+        )
+    else:
+        reason = None   # Käytetään eta-reasonia
+
+    # ── ETA-urgency ──────────────────────────────────────
+    if 0 <= eta <= 5:
+        eta_urgency = 6
+        eta_score   = score_base * 1.5
+        if reason is None:
+            reason = (
+                f"🚆 {train.label()} saapuu ~{max(0,int(eta))}min "
+                f"({train.origin}→{train.station_name})"
+            )
+    elif 5 < eta <= 15:
+        eta_urgency = 5
+        eta_score   = score_base * 1.2
+        if reason is None:
+            reason = (
+                f"🚆 {train.label()} saapuu {int(eta)}min päästä "
+                f"({train.origin}→{train.station_name})"
+            )
+    elif 15 < eta <= 30:
+        eta_urgency = 3
+        eta_score   = score_base
+        if reason is None:
+            reason = (
+                f"🚆 {train.label()} saapuu {int(eta)}min päästä "
+                f"({train.origin}→{train.station_name})"
+            )
+    else:
+        eta_urgency = 2
+        eta_score   = score_base * 0.7
+        if reason is None:
+            reason = (
+                f"🚆 {train.label()} saapuu {int(eta)}min päästä"
+            )
+
+    # Lopullinen urgency = max(delay, eta)
+    final_urgency = max(delay_urgency, eta_urgency)
+    final_score   = eta_score + delay_bonus
+
+    expires = train.effective_at + timedelta(minutes=15)
+
+    return Signal(
+        area=train.area,
+        score_delta=round(final_score, 1),
+        reason=reason,
+        urgency=final_urgency,
+        expires_at=expires,
+        source_url=f"https://rata.digitraffic.fi/train/{train.train_number}",
+    )
+```
+
+# ══════════════════════════════════════════════════════════════
+
+# DIGITRAFFIC JSON -JÄSENNIN
+
+# ══════════════════════════════════════════════════════════════
+
+def _parse_trains(
+data: list[dict],
+station_code: str,
+) -> list[TrainArrival]:
+“””
+Jäsennä Digitrafficin live-trains JSON → lista TrainArrival-olioita.
+
+```
+Jokainen juna sisältää timeTableRows-listan.
+Etsitään rivit jossa stationShortCode == station_code
+ja type == "ARRIVAL".
+"""
+arrivals: list[TrainArrival] = []
+
+if not isinstance(data, list):
+    return arrivals
+
+for train in data:
+    try:
+        category = train.get("trainCategory", "")
+        if category in SKIP_TRAIN_CATEGORIES:
+            continue
+
+        train_number = train.get("trainNumber", 0)
+        train_type   = train.get("trainType", "?")
+        cancelled    = train.get("cancelled", False)
+
+        rows = train.get("timeTableRows", [])
+
+        # Etsi ensin lähtö- ja määränpääasema
+        origin      = _find_origin(rows)
+        destination = _find_destination(rows)
+
+        # Etsi kyseisen aseman saapumisrivi
+        for row in rows:
+            if (row.get("stationShortCode") == station_code
+                    and row.get("type") == "ARRIVAL"):
+                scheduled_str = row.get("scheduledTime", "")
+                estimate_str  = row.get("liveEstimateTime", "")
+                actual_str    = row.get("actualTime", "")
+
+                scheduled = _parse_dt(scheduled_str)
+                if scheduled is None:
+                    continue
+
+                estimated = _parse_dt(estimate_str)
+                actual    = _parse_dt(actual_str)
+                track     = row.get("commercialTrack")
+
+                arrivals.append(TrainArrival(
+                    train_number=train_number,
+                    train_type=train_type,
+                    train_category=category,
+                    station_code=station_code,
+                    scheduled_at=scheduled,
+                    estimated_at=estimated,
+                    actual_at=actual,
+                    cancelled=cancelled,
+                    origin=origin,
+                    destination=destination,
+                    track=int(track) if track and str(track).isdigit()
+                          else None,
+                ))
+                break  # Yksi saapumisrivi per asema per juna
+
+    except Exception:
+        continue   # Rikkinäinen juna ei kaada koko parsintaa
+
+return arrivals
+```
+
+def _find_origin(rows: list[dict]) -> str:
+“”“Ensimmäinen pysähdys = lähtöasema.”””
+for row in rows:
+if row.get(“type”) == “DEPARTURE”:
+return row.get(“stationShortCode”, “”)
+return “”
+
+def _find_destination(rows: list[dict]) -> str:
+“”“Viimeinen pysähdys = määränpää.”””
+for row in reversed(rows):
+if row.get(“type”) == “ARRIVAL”:
+return row.get(“stationShortCode”, “”)
+return “”
+
+def _parse_dt(s: str) -> Optional[datetime]:
+“”“Jäsennä Digitrafficin ISO 8601 aikaleima → datetime UTC.”””
+if not s:
+return None
+try:
+return datetime.fromisoformat(s.replace(“Z”, “+00:00”)).astimezone(
+timezone.utc
+)
+except ValueError:
+return None
+
+def _train_score_base(train: TrainArrival) -> float:
+“””
+Peruspisteet junatyypin mukaan.
+Pitkän matkan junat tuovat enemmän matkustajia kuin lähijunat.
+“””
+category = train.train_category
+ttype    = train.train_type.upper()
+
+```
+if category == "Long-distance":
+    if ttype in ("IC2", "IC"):    return 18.0
+    if ttype in ("S", "PYO"):     return 20.0   # Pendolino
+    if ttype in ("EC", "AE"):     return 22.0   # Kansainvälinen
+    return 15.0
+
+if category == "Commuter":
+    # HSL lähijunat — pienempi kuorma per juna mutta tiheämmin
+    return 10.0
+
+return 8.0   # Muu
+```
+
+# ══════════════════════════════════════════════════════════════
+
+# APUFUNKTIO TESTAUKSEEN
+
+# ══════════════════════════════════════════════════════════════
+
+def make_test_train(
+station: str = “HKI”,
+eta_minutes: float = 10.0,
+delay_minutes: int = 0,
+train_type: str = “IC”,
+category: str = “Long-distance”,
+cancelled: bool = False,
+) -> TrainArrival:
+“”“Luo testijuna annetuilla parametreilla.”””
+now = datetime.now(timezone.utc)
+scheduled = now + timedelta(minutes=eta_minutes)
+estimated = (now + timedelta(minutes=eta_minutes + delay_minutes)
+if delay_minutes > 0 else None)
+return TrainArrival(
+train_number=123,
+train_type=train_type,
+train_category=category,
+station_code=station,
+scheduled_at=scheduled,
+estimated_at=estimated,
+origin=“TPE”,
+destination=station,
+cancelled=cancelled,
+)
